@@ -5,6 +5,7 @@ import argparse
 from itertools import repeat, starmap
 from datetime import datetime
 from time import time, sleep
+from random import random
 
 DEVICE_IP_ADDRESS = "128.141.143.244"
 DEVICE_USER = "admin"
@@ -35,6 +36,26 @@ def voltage_divider(voltage: float,
         voltages.append(voltage_divided)
     return voltages
 
+def wait_for_ramping(hv_wrapper, chamber):
+    sleep(2)
+    while True:
+        sleep(0.1)
+        ramping = False
+        for s, c in mapping[chamber]:
+            status = hv_wrapper.get_ch_param_ushort(s, c, 'Status')
+            if status & 0x6:  # Bit 1: ramping up, Bit 2: ramping down
+                ramping = True
+        if not ramping:
+            break
+
+def wait_for_ramping_single_ch(hv_wrapper, slot, channel):
+    sleep(2)
+    while True:
+        sleep(0.1)
+        status = hv_wrapper.get_ch_param_ushort(slot, channel, 'Status')
+        if not (status & 0x6):  # Bit 1: ramping up, Bit 2: ramping down
+            break
+
 def RampUp_Chamber_Voltages(hv_wrapper, chamber, config):
     print(f"Ramping up voltages for chamber {chamber} with V_init={config['V_init']}, V_step={config['V_step']}, V_max={config['V_max']}, t_stabilize={config['t_stabilize']}")
 
@@ -58,16 +79,8 @@ def RampUp_Chamber_Voltages(hv_wrapper, chamber, config):
         for s, c in mapping[chamber]:
             hv_wrapper.set_ch_param_float(s, c, "V0Set", voltages[mapping[chamber].index([s, c])])
         # Wait until all channels have finished ramping up (Bit 1 == 0)
-        while True:
-            ramping = False
-            for s, c in mapping[chamber]:
-                status = hv_wrapper.get_ch_param_ushort(s, c, 'Status')
-                if status & 0x2:  # Bit 1: ramping up
-                    ramping = True
-                    break
-            if not ramping:
-                break
-            sleep(0.1)
+        wait_for_ramping(hv_wrapper, chamber)
+
         # Wait for the voltage to stabilize
         sleep(t_stb/4)
         imon, vmon = [0 for _ in range(7)], [0 for _ in range(7)]
@@ -86,6 +99,9 @@ def RampUp_Chamber_Voltages(hv_wrapper, chamber, config):
     for foil in [1, 3, 5]:  # G3T, G2T, G1T
         s, c = mapping[chamber][foil]
         hv_wrapper.set_ch_param_float(s, c, "V0Set", V_foil)
+    # Wait until all channels have finished ramping up
+    wait_for_ramping(hv_wrapper, chamber)
+
     sleep(t_stb/4)
     imon, vmon = [0 for _ in range(7)], [0 for _ in range(7)]
     for _ in range(3):
@@ -102,6 +118,7 @@ def RampUp_Chamber_Voltages(hv_wrapper, chamber, config):
     for s, c in mapping[chamber]:
         hv_wrapper.set_ch_param_float(s, c, "I0Set", 2) # Set current limit to 2 uA
     print(f"Ramp up completed for chamber {chamber}.")
+    return 0
 
 def Stability_Monitor(hv_wrapper, chamber, config):
     Duration = config["Duration"]
@@ -129,79 +146,93 @@ def Stability_Monitor(hv_wrapper, chamber, config):
                 f.write(line)
                 # Power off all channels and wait for 200 s
                 for s, c in mapping[chamber]:
+                    power = hv_wrapper.get_ch_power(s, c)
                     hv_wrapper.set_ch_param_ushort(s, c, "Pw", 0)
                 sleep(200)
                 # Power on all channels and set voltages
                 for s, c in mapping[chamber]:
+                    power = hv_wrapper.get_ch_power(s, c)
                     hv_wrapper.set_ch_param_ushort(s, c, "Pw", 1)
                     hv_wrapper.set_ch_param_float(s, c, "I0Set", 20)
                     hv_wrapper.set_ch_param_float(s, c, "V0Set", voltages[mapping[chamber].index([s, c])])
-            sleep(0.1)
+                wait_for_ramping(hv_wrapper, chamber)    
+            sleep(0.5)
         end_time = datetime.now().strftime('%d/%m/%Y %H:%M:%S')
         f.write(f"End time: {end_time}\n")
+    return 0
 
 def Stress_Test(hv_wrapper, chamber, config):
     V_init = config["V_init"]
     V_max = config["V_max"]
     V_step = config["V_step"]
     t_stb = config["t_stabilize"]
+    t_hold = config["t_hold"]
     n_cycles = config["n_cycles"]
     output = f"ME0-stress-{chamber}_{config['Date']}.txt"
 
     with open(output, "w") as f:
         for ifoil, foil in enumerate([5, 3, 1]): # G1T, G2T, G3T
             s, c = mapping[chamber][foil]
-            if hv_wrapper.get_ch_param_ushort(s, c, "Pw") == 0:
+            print(f"Chamber {chamber} on slot {s}, channel {c} power status: {hv_wrapper.get_ch_power(s, c)}")
+            if hv_wrapper.get_ch_power(s, c) == 0:
                 print(f"Powering on chamber {chamber} on slot {s}, channel {c}")
                 hv_wrapper.set_ch_param_ushort(s, c, "Pw", 1)
-            hv_wrapper.set_ch_param_float(s, c, "RUp", 10)  # Set ramp up to 10 Vps
+            else:
+                print(f"Chamber {chamber} on slot {s}, channel {c} is already powered on.")
+                hv_wrapper.set_ch_param_ushort(s, c, "Pw", 0)  # Power off before ramping up
+                sleep(20)
+                hv_wrapper.set_ch_param_ushort(s, c, "Pw", 1)  # Power on after waiting
+            
+            hv_wrapper.set_ch_param_float(s, c, "RUp", 5)  # Set ramp up to 5 Vps
             for cycle in range(n_cycles):
                 V_current = V_init
                 while V_current < V_max + 1e-6:  # Allow for floating point precision issues
                     hv_wrapper.set_ch_param_float(s, c, "I0Set", 20)  # Set current limit to 20 uA
                     hv_wrapper.set_ch_param_float(s, c, "V0Set", V_current)
-                    while True:
-                        status = hv_wrapper.get_ch_param_ushort(s, c, 'Status')
-                        if not (status & 0x2):
-                            break
-                        sleep(0.1)
+                    # Wait for the lamp up is complete
+                    wait_for_ramping_single_ch(hv_wrapper, s, c)
+
                     hv_wrapper.set_ch_param_float(s, c, "I0Set", 2)  # Set current limit to 2 uA
                     sleep(t_stb)
-                    if status & 0x4:  # Bit 2: ready
-                        hv_wrapper.set_ch_param_float(s, c, "I0Set", 2)  # Set current limit to 2 uA
+                    status = hv_wrapper.get_ch_param_ushort(s, c, 'Status')
                     if status & 0x40 or status & 0x200:  # Trip or Max V protection
                         f.write(f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}, Trip on GEM #{ifoil+1}, at {V_current:.2f} V.\n")
                         break
-                    if abs(V_current-V_max) < 1e-6:
-                        f.write(f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}, No Trip on GEM #{ifoil+1}.\n")
-                        break
+                    print(V_current, cycle, ifoil+1)
                     V_current += V_step
-                hv_wrapper.set_ch_param_float(s, c, "V0Set", 0)  # Set voltage to 0 V after each cycle
-            if hv_wrapper.get_ch_param_ushort(s, c, "Pw") == 1:
-                print(f"Powering off chamber {chamber} on slot {s}, channel {c}")
-                hv_wrapper.set_ch_param_ushort(s, c, "Pw", 0)
+                hv_wrapper.set_ch_param_float(s, c, "V0Set", V_init)  # Set voltage to 0 V after each cycle
+                wait_for_ramping_single_ch(hv_wrapper, s, c)
+            print(f"Powering off chamber {chamber} on slot {s}, channel {c}")
+            hv_wrapper.set_ch_param_ushort(s, c, "Pw", 0)
+            print("a")
+            sleep(t_hold)
+    return 0
 
 def QC6_Short(hv_wrapper, chamber, config):
     print(f"Setting Power on of chamber {chamber} ")
     for s, c in mapping[chamber]:
-        if hv_wrapper.get_ch_param_ushort(s, c, "Pw") == 0:
+        power = hv_wrapper.get_ch_power(s, c)
+        if power == 0:
             hv_wrapper.set_ch_param_ushort(s, c, "Pw", 1)
             print(f"Powering on chamber {chamber} on slot {s}, channel {c}")
         else:
             print(f"Chamber {chamber} on slot {s}, channel {c} is already powered on.")
+            hv_wrapper.set_ch_param_ushort(s, c, "Pw", 0)  # Power off before ramping up
+            sleep(20)
+            hv_wrapper.set_ch_param_ushort(s, c, "Pw", 1)  # Power on after waiting
     RampUp_Chamber_Voltages(hv_wrapper, chamber, config)
     Stability_Monitor(hv_wrapper, chamber, config)
     for s, c in mapping[chamber]:
-        if hv_wrapper.get_ch_param_ushort(s, c, "Pw") == 1:
-            hv_wrapper.set_ch_param_ushort(s, c, "Pw", 0)
-            print(f"Powering off chamber {chamber} on slot {s}, channel {c}")
-        else:
-            print(f"Chamber {chamber} on slot {s}, channel {c} is already powered off.")
+        power = hv_wrapper.get_ch_power(s, c)
+        hv_wrapper.set_ch_param_ushort(s, c, "Pw", 0)
+        print(f"Powering off chamber {chamber} on slot {s}, channel {c}")
+    return 0
 
 def QC6_Long(hv_wrapper, chamber, config):
     print(f"Setting Power on of chamber {chamber} ")
     for s, c in mapping[chamber]:
-        if hv_wrapper.get_ch_param_ushort(s, c, "Pw") == 0:
+        power = hv_wrapper.get_ch_power(s, c)
+        if power == 0:
             hv_wrapper.set_ch_param_ushort(s, c, "Pw", 1)
             print(f"Powering on chamber {chamber} on slot {s}, channel {c}")
         else:
@@ -216,24 +247,15 @@ def QC6_Long(hv_wrapper, chamber, config):
         hv_wrapper.set_ch_param_float(s, c, "I0Set", 20)
     for s, c in mapping[chamber]:
         hv_wrapper.set_ch_param_float(s, c, "V0Set", voltages[mapping[chamber].index([s, c])])
-    # Wait until all channels have finished ramping up (Bit 1 == 0)
-    while True:
-        ramping = False
-        for s, c in mapping[chamber]:
-            status = hv_wrapper.get_ch_param_ushort(s, c, 'Status')
-            if status & 0x2:  # Bit 1: ramping up
-                ramping = True
-                break
-        if not ramping:
-            break
-        sleep(0.1)
+    # Wait until all channels have finished ramping up
+    wait_for_ramping(hv_wrapper, chamber)
+
     Stability_Monitor(hv_wrapper, chamber, config)
     for s, c in mapping[chamber]:
-        if hv_wrapper.get_ch_param_ushort(s, c, "Pw") == 1:
-            hv_wrapper.set_ch_param_ushort(s, c, "Pw", 0)
-            print(f"Powering off chamber {chamber} on slot {s}, channel {c}")
-        else:
-            print(f"Chamber {chamber} on slot {s}, channel {c} is already powered off.")
+        power = hv_wrapper.get_ch_power(s, c)
+        hv_wrapper.set_ch_param_ushort(s, c, "Pw", 0)
+        print(f"Powering off chamber {chamber} on slot {s}, channel {c}")
+    return 0
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run QC6 tests on CAEN HV system.")
@@ -274,14 +296,16 @@ if __name__ == "__main__":
                         help="Chamber to run the stress test on. (!Important: Use the full name of the chamber that is used in the mapping.json file.)")
     subparser_stress.add_argument("--date", type=int, default=None,
                         help="Date of the run in YYYYMMDD format. If not specified, the current date will be used.")
-    subparser_stress.add_argument("--V_init", type=int, default=200,
-                        help="Initial voltage for the stress test. Default is 200 V.")
+    subparser_stress.add_argument("--V_init", type=int, default=10,
+                        help="Initial voltage for the stress test. Default is 10 V.")
     subparser_stress.add_argument("--V_max", type=int, default=1000,
                         help="Maximum voltage for the stress test. Default is 1000 V.")
     subparser_stress.add_argument("--V_step", type=int, default=10,
                         help="Voltage step for the stress test. Default is 10 V.")
-    subparser_stress.add_argument("--t_stabilize", type=int, default=30,
-                        help="Time to stabilize the voltage in seconds. Default is 30 seconds.")
+    subparser_stress.add_argument("--t_stabilize", type=int, default=5,
+                        help="Time to stabilize the voltage in seconds. Default is 5 seconds.")
+    subparser_stress.add_argument("--t_hold", type=int, default=60,
+                        help="Time to hold after finishing the cycle in one GEM foil in seconds. Default is 5 seconds.")
     subparser_stress.add_argument("--n_cycles", type=int, default=5,
                         help="Number of cycles for the stress test. Default is 5 cycles.")
     args = parser.parse_args()
@@ -317,6 +341,7 @@ if __name__ == "__main__":
             "V_max": args.V_max,
             "V_step": args.V_step,
             "t_stabilize": args.t_stabilize,
+            "t_hold": args.t_hold,
             "n_cycles": args.n_cycles,
             "test_type": "stress"
         }
